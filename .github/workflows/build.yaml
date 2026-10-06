@@ -1,0 +1,93 @@
+name: macOS build
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORK: 0xGingi/fluffychat
+  UPSTREAM: krille-chan/fluffychat
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+      build: ${{ steps.sync.outputs.build }}
+    steps:
+      - id: sync
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          gh repo sync "$FORK" --source "$UPSTREAM" --branch main
+          sha=$(gh api "repos/$FORK/commits/main" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=${sha::7}" >> "$GITHUB_OUTPUT"
+          # ponytail: one release per upstream commit; delete the release to force a rebuild
+          if GH_TOKEN=${{ github.token }} gh release view "${sha::7}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.FORK }}
+          ref: ${{ needs.check.outputs.sha }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: .tool_versions.yaml
+          cache: true
+      - run: sudo xcode-select --switch /Applications/Xcode_26.3.app
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build unsigned, re-signed with Developer ID below
+        run: |
+          sed -i '' \
+            -e 's/CODE_SIGN_IDENTITY = "Apple Development";/CODE_SIGN_IDENTITY = "-";/' \
+            -e 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/' \
+            -e 's/DEVELOPMENT_TEAM = [A-Z0-9]*;/DEVELOPMENT_TEAM = "";/' \
+            macos/Runner.xcodeproj/project.pbxproj
+          # keychain-access-groups needs a provisioning profile; Developer ID without one rejects it
+          /usr/libexec/PlistBuddy -c "Delete :keychain-access-groups" macos/Runner/Release.entitlements
+      - run: flutter pub get
+      - run: flutter build macos --release
+      - uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+      - name: Sign, notarize, staple
+        working-directory: build/macos/Build/Products/Release
+        env:
+          ID: Developer ID Application
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          find FluffyChat.app/Contents/Frameworks -depth \( -name '*.framework' -o -name '*.dylib' \) \
+            -exec codesign --force --options runtime --timestamp --sign "$ID" {} \;
+          codesign --force --options runtime --timestamp \
+            --entitlements "$GITHUB_WORKSPACE/macos/Runner/Release.entitlements" \
+            --sign "$ID" FluffyChat.app
+          ditto -c -k --keepParent FluffyChat.app notarize.zip
+          xcrun notarytool submit notarize.zip --wait \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          xcrun stapler staple FluffyChat.app
+          ditto -c -k --keepParent FluffyChat.app "$GITHUB_WORKSPACE/FluffyChat-macos.zip"
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          gh release create "$TAG" FluffyChat-macos.zip --repo "$GITHUB_REPOSITORY" \
+            --title "FluffyChat $(date +%Y-%m-%d) ($TAG)" \
+            --notes "Built from https://github.com/$FORK/commit/${{ needs.check.outputs.sha }}"
