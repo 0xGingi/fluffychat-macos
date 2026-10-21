@@ -60,6 +60,12 @@ jobs:
           # keychain-access-groups needs a provisioning profile; Developer ID without one rejects it
           /usr/libexec/PlistBuddy -c "Delete :keychain-access-groups" macos/Runner/Release.entitlements
       - run: flutter pub get
+      - name: Use legacy keychain, data protection keychain needs the keychain-access-groups entitlement stripped above
+        run: |
+          root=$(jq -r '.packages[] | select(.name == "flutter_secure_storage") | .rootUri' .dart_tool/package_config.json | sed 's|^file://||')
+          f="$root/lib/options/macos_options.dart"
+          sed -i '' 's/this.usesDataProtectionKeychain = true/this.usesDataProtectionKeychain = false/' "$f"
+          grep -q 'this.usesDataProtectionKeychain = false' "$f"
       - run: flutter build macos --release
       - uses: apple-actions/import-codesign-certs@v3
         with:
