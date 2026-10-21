@@ -46,7 +46,7 @@ jobs:
           ref: ${{ needs.check.outputs.sha }}
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version-file: .tool_versions.yaml
+          flutter-version-file: .fvmrc
           cache: true
       - run: sudo xcode-select --switch /Applications/Xcode_26.3.app
       - uses: dtolnay/rust-toolchain@stable
